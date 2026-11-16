@@ -1,0 +1,167 @@
+$Base = "http://localhost:8000"
+$script:failed = 0
+
+function Call($Method, $Path, $Body = $null, $Headers = @{}, $ContentType = "application/json") {
+    $p = @{ Uri = "$Base$Path"; Method = $Method; Headers = $Headers; UseBasicParsing = $true }
+    if ($null -ne $Body) {
+        $p.Body = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 5 }
+        $p.ContentType = $ContentType
+    }
+    try {
+        $r = Invoke-WebRequest @p
+        $code = [int]$r.StatusCode
+        $text = $r.Content
+    } catch {
+        if ($null -eq $_.Exception.Response) { throw }
+        $code = [int]$_.Exception.Response.StatusCode
+        $text = $_.ErrorDetails.Message
+        if (-not $text) {
+            try {
+                $stream = $_.Exception.Response.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($stream)
+                $text = $reader.ReadToEnd()
+            } catch {}
+        }
+    }
+    $json = $null
+    if ($text) { try { $json = $text | ConvertFrom-Json } catch {} }
+    [pscustomobject]@{ Code = $code; Json = $json }
+}
+
+function Check($label, $ok) {
+    if ($ok) { Write-Host "[PASS] $label" -ForegroundColor Green }
+    else { Write-Host "[FAIL] $label" -ForegroundColor Red; $script:failed++ }
+}
+
+$other = @{ "X-Dev-User" = "other" }
+
+$r = Call GET "/api/health"
+Check "Health returns 200" ($r.Code -eq 200)
+
+# Create
+$r = Call POST "/api/tasks" @{ title = "Test task"; priority = "high"; tags = @("a", "b"); dueDate = "2026-12-01" }
+Check "Create task returns 201" ($r.Code -eq 201 -and $r.Json.task.title -eq "Test task")
+$id = $r.Json.task.id
+
+$r = Call POST "/api/tasks" '{"title":""}'
+Check "Empty title rejected (422)" ($r.Code -eq 422 -and $null -ne $r.Json.errors.title)
+
+$r = Call POST "/api/tasks" @{ title = "x"; priority = "urgent" }
+Check "Bad priority rejected (422)" ($r.Code -eq 422)
+
+$r = Call POST "/api/tasks" @{ title = "x"; status = "done" }
+Check "Bad status rejected (422)" ($r.Code -eq 422)
+
+$r = Call POST "/api/tasks" @{ title = "x"; startDate = "2026-12-10"; dueDate = "2026-12-01" }
+Check "Start after due rejected (422)" ($r.Code -eq 422)
+
+$r = Call POST "/api/tasks" @{ title = "x"; dueDate = "2026-02-31" }
+Check "Impossible date rejected (422)" ($r.Code -eq 422)
+
+$r = Call POST "/api/tasks" @{ title = "x"; tags = @("1", "2", "3", "4", "5", "6") }
+Check "Too many tags rejected (422)" ($r.Code -eq 422)
+
+$r = Call POST "/api/tasks" @{ title = "x"; description = ("a" * 11000) }
+Check "Oversized body rejected (413)" ($r.Code -eq 413)
+
+$r = Call POST "/api/tasks" "title=x" @{} "text/plain"
+Check "Wrong Content-Type rejected (415)" ($r.Code -eq 415)
+
+$r = Call POST "/api/tasks" "{ not json"
+Check "Invalid JSON rejected (400)" ($r.Code -eq 400)
+
+$r = Call POST "/api/tasks" "[1,2,3]"
+Check "JSON list instead of object rejected (400)" ($r.Code -eq 400)
+
+$r = Call POST "/api/tasks" @{ title = "<script>alert(1)</script>" }
+Check "HTML title stored as plain text" ($r.Code -eq 201 -and $r.Json.task.title -eq "<script>alert(1)</script>")
+$xssId = $r.Json.task.id
+
+# Read
+$r = Call GET "/api/tasks"
+Check "List contains my task" ($r.Code -eq 200 -and (@($r.Json.tasks | Where-Object { $_.id -eq $id }).Count -eq 1))
+
+$r = Call GET "/api/tasks/$id"
+Check "Get one task" ($r.Code -eq 200 -and $r.Json.task.id -eq $id)
+
+$r = Call GET "/api/tasks/abc"
+Check "Non-numeric id gives 404" ($r.Code -eq 404)
+
+$r = Call GET "/api/tasks/99999999"
+Check "Missing task gives 404" ($r.Code -eq 404)
+
+# IDOR: the other user
+$r = Call GET "/api/tasks/$id" $null $other
+Check "Other user CANNOT read my task (404)" ($r.Code -eq 404)
+
+$r = Call GET "/api/tasks" $null $other
+Check "Other user list does not include my task" ($r.Code -eq 200 -and (@($r.Json.tasks | Where-Object { $_.id -eq $id }).Count -eq 0))
+
+$r = Call PUT "/api/tasks/$id" @{ title = "hacked" } $other
+Check "Other user CANNOT update my task (404)" ($r.Code -eq 404)
+
+$r = Call DELETE "/api/tasks/$id" $null $other
+Check "Other user CANNOT delete my task (404)" ($r.Code -eq 404)
+
+# Update and mass assignment
+$r = Call PUT "/api/tasks/$id" @{ status = "completed"; userId = 999; id = 999; user_id = 999 }
+Check "Update works, userId/id in body ignored" ($r.Code -eq 200 -and $r.Json.task.status -eq "completed" -and $r.Json.task.id -eq $id)
+
+$r = Call GET "/api/tasks/$id" $null $other
+Check "Task still invisible to other user after mass-assignment attempt" ($r.Code -eq 404)
+
+$r = Call PATCH "/api/tasks/$id" @{ title = "Renamed" }
+Check "PATCH changes only the title" ($r.Code -eq 200 -and $r.Json.task.title -eq "Renamed" -and $r.Json.task.priority -eq "high")
+
+$r = Call PUT "/api/tasks/$id" @{ foo = "bar" }
+Check "Update with no valid fields rejected (422)" ($r.Code -eq 422)
+
+# Categories
+$name = "Work-" + (Get-Random)
+$r = Call POST "/api/categories" @{ name = $name; color = "#ff0000" }
+Check "Create category returns 201" ($r.Code -eq 201)
+$catId = $r.Json.category.id
+
+$r = Call POST "/api/categories" @{ name = $name }
+Check "Duplicate category name gives 409" ($r.Code -eq 409)
+
+$r = Call POST "/api/categories" @{ name = "x"; color = "red" }
+Check "Bad color rejected (422)" ($r.Code -eq 422)
+
+$r = Call POST "/api/tasks" @{ title = "With category"; categoryId = $catId }
+Check "Task can use my category" ($r.Code -eq 201 -and $r.Json.task.category -eq $name)
+$catTaskId = $r.Json.task.id
+
+$r = Call POST "/api/tasks" @{ title = "Stolen category"; categoryId = $catId } $other
+Check "Other user CANNOT use my category (422)" ($r.Code -eq 422)
+
+$r = Call GET "/api/categories" $null $other
+Check "Other user does not see my category" ($r.Code -eq 200 -and (@($r.Json.categories | Where-Object { $_.id -eq $catId }).Count -eq 0))
+
+$r = Call DELETE "/api/categories/$catId" $null $other
+Check "Other user CANNOT delete my category (404)" ($r.Code -eq 404)
+
+$r = Call DELETE "/api/categories/$catId"
+Check "I can delete my category" ($r.Code -eq 200)
+
+$r = Call GET "/api/tasks/$catTaskId"
+Check "Task survives category deletion, category becomes empty" ($r.Code -eq 200 -and $null -eq $r.Json.task.categoryId)
+
+# Method and route handling
+$r = Call PUT "/api/tasks" @{ title = "x" }
+Check "Wrong method gives 405" ($r.Code -eq 405)
+
+$r = Call GET "/api/nothing"
+Check "Unknown route gives 404" ($r.Code -eq 404)
+
+# Delete and cleanup
+$r = Call DELETE "/api/tasks/$id"
+Check "Delete my task" ($r.Code -eq 200)
+$r = Call GET "/api/tasks/$id"
+Check "Deleted task is gone (404)" ($r.Code -eq 404)
+Call DELETE "/api/tasks/$xssId" | Out-Null
+Call DELETE "/api/tasks/$catTaskId" | Out-Null
+
+Write-Host ""
+if ($script:failed -eq 0) { Write-Host "All checks passed." -ForegroundColor Green }
+else { Write-Host "$($script:failed) check(s) FAILED." -ForegroundColor Red }

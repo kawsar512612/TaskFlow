@@ -1,0 +1,62 @@
+
+# =========================
+# Environment / Secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# Private credentials and keys
+*.pem
+*.key
+id_rsa
+id_ed25519
+credentials.json
+service-account.json
+
+# =========================
+# PHP / Composer
+# =========================
+/server/vendor/
+/server/.phpunit.cache/
+
+# =========================
+# React / Node
+# =========================
+/client/node_modules/
+/client/dist/
+/client/.vite/
+/client/coverage/
+
+# =========================
+# Logs and temporary files
+# =========================
+*.log
+*.tmp
+*.temp
+/server/security-result.txt
+
+# =========================
+# Database backups
+# =========================
+*-Backup-*.zip
+*-Database-Backup-*.sql
+*.sql.gz
+*.dump
+*.bak
+
+# =========================
+# User uploads / Runtime data
+# =========================
+/server/storage/logs/
+/server/storage/cache/
+/server/storage/sessions/
+
+# =========================
+# Editor / OS
+# =========================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
